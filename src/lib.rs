@@ -62,12 +62,24 @@ pub mod negcon;
 extern crate bit_reverse;
 extern crate bitflags;
 extern crate byteorder;
+
+#[cfg(feature = "embedded-hal-02")]
 extern crate embedded_hal_02 as hal;
+#[cfg(feature = "embedded-hal-1")]
+extern crate embedded_hal_1 as hal;
 
 use bit_reverse::ParallelReverse;
 use core::fmt;
+
+#[cfg(feature = "embedded-hal-02")]
 use hal::blocking::spi;
+#[cfg(feature = "embedded-hal-02")]
 use hal::digital::v2::OutputPin;
+
+#[cfg(feature = "embedded-hal-1")]
+use hal::digital::OutputPin;
+#[cfg(feature = "embedded-hal-1")]
+use hal::spi::SpiDevice;
 
 use baton::Baton;
 use classic::{Classic, GamepadButtons};
@@ -285,6 +297,15 @@ pub struct PlayStationPort<SPI, CS> {
     multitap_port: MultitapPort,
 }
 
+impl<SPI, CS> PlayStationPort<SPI, CS> {
+    fn flip(bytes: &mut [u8]) {
+        for byte in bytes.iter_mut() {
+            *byte = byte.swap_bits();
+        }
+    }
+}
+
+#[cfg(feature = "embedded-hal-02")]
 impl<E, SPI, CS> PlayStationPort<SPI, CS>
 where
     SPI: spi::Transfer<u8, Error = E>,
@@ -302,12 +323,6 @@ where
             dev: spi,
             select,
             multitap_port: MultitapPort::A,
-        }
-    }
-
-    fn flip(bytes: &mut [u8]) {
-        for byte in bytes.iter_mut() {
-            *byte = byte.swap_bits();
         }
     }
 
@@ -469,6 +484,199 @@ where
     /// Ask the controller for input states. Different contoller types will be returned automatically
     /// for you. If you'd like to cooerce a controller yourself, use `read_raw`.
     pub fn read_input(&mut self, command: Option<&dyn PollCommand>) -> Result<Device, Error<E>> {
+        let mut buffer = [0u8; MESSAGE_MAX_LENGTH];
+        let data = self.read_port(command)?;
+
+        // Shift the controller data over because we don't need the header anymore
+        buffer[0..MESSAGE_MAX_LENGTH - 3].copy_from_slice(&data[HEADER_LEN..]);
+
+        let controller = ControllerData { data: buffer };
+        let device;
+
+        unsafe {
+            device = match data[1] {
+                CONTROLLER_NOT_PRESENT => Device::None,
+                CONTROLLER_CONFIGURATION => Device::ConfigurationMode,
+                CONTROLLER_MOUSE => Device::Mouse(controller.pm),
+                CONTROLLER_CLASSIC => Device::Classic(controller.classic),
+                CONTROLLER_ANALOG_JOYSTICK => Device::AnalogJoystick(controller.ds),
+                CONTROLLER_DUALSHOCK_DIGITAL => Device::Classic(controller.classic),
+                CONTROLLER_DUALSHOCK_ANALOG => Device::DualShock(controller.ds),
+                CONTROLLER_DUALSHOCK_PRESSURE => Device::DualShock2(controller.ds2),
+                CONTROLLER_JOGCON => Device::JogCon(controller.jc),
+                CONTROLLER_NEGCON => Device::NegCon(controller.nc),
+                CONTROLLER_GUNCON => Device::GunCon(controller.gc),
+                _ => Device::Unknown,
+            }
+        }
+
+        Ok(device)
+    }
+}
+
+#[cfg(feature = "embedded-hal-1")]
+impl<SPI, CS> PlayStationPort<SPI, CS>
+where
+    SPI: SpiDevice,
+    CS: OutputPin,
+{
+    /// Create a new device to talk over the PlayStation's controller
+    /// port
+    pub fn new(spi: SPI, mut select: Option<CS>) -> Self {
+        // If a select pin was provided, disable the controller for now
+        if let Some(ref mut x) = select {
+            let _ = x.set_high();
+        }
+
+        Self {
+            dev: spi,
+            select,
+            multitap_port: MultitapPort::A,
+        }
+    }
+
+    /// Set the active port on the multi-tap. If no tap is being used, anything
+    /// other than `A` will fail to return anything. Or so I assume! Setting this
+    /// will mean any commands send will be directed towards that port indefinitely.
+    pub fn set_multitap_port(&mut self, port: MultitapPort) {
+        self.multitap_port = port;
+    }
+
+    /// Sends commands to the underlying hardware and provides responses
+    pub fn send_command(&mut self, command: &[u8], result: &mut [u8]) -> Result<(), SPI::Error> {
+        // Pack in bytes for the command we'll be sending
+        result[..command.len()].copy_from_slice(command);
+        result[0] = self.multitap_port.clone() as u8;
+
+        // Because not all hardware supports LSB mode for SPI, we flip
+        // the bits ourselves
+        Self::flip(result);
+
+        if let Some(ref mut x) = self.select {
+            let _ = x.set_low();
+        }
+
+        self.dev.transfer_in_place(result)?;
+
+        if let Some(ref mut x) = self.select {
+            let _ = x.set_high();
+        }
+
+        Self::flip(result);
+
+        Ok(())
+    }
+
+    /// Configure the controller to set it to DualShock2 mode. This will also
+    /// enable analog mode on DualShock1 controllers.
+    pub fn enable_pressure(&mut self) -> Result<(), SPI::Error> {
+        let mut buffer = [0u8; MESSAGE_MAX_LENGTH];
+
+        // Wake up the controller if needed
+        self.send_command(CMD_POLL, &mut buffer)?;
+
+        self.send_command(CMD_ENTER_ESCAPE_MODE, &mut buffer)?;
+        self.send_command(CMD_SET_MODE, &mut buffer)?;
+        self.send_command(CMD_MOTOR_DUALSHOCK, &mut buffer)?;
+        self.send_command(CMD_INIT_PRESSURE, &mut buffer)?;
+        self.send_command(CMD_RESPONSE_FORMAT, &mut buffer)?;
+        self.send_command(CMD_EXIT_ESCAPE_MODE, &mut buffer)?;
+
+        Ok(())
+    }
+
+    /// Configure the JogCon for wheel control.
+    ///
+    /// If no digital buttons are pressed in this mode for 60 seconds, the
+    /// JogCon will go to sleep until buttons are pressed. If no polling is
+    /// done for 10 seconds, it will drop out of this mode and revert to
+    /// the standard Controller mode
+    pub fn enable_jogcon(&mut self) -> Result<(), SPI::Error> {
+        let mut buffer = [0u8; MESSAGE_MAX_LENGTH];
+
+        // Wake up the controller if needed
+        self.send_command(CMD_POLL, &mut buffer)?;
+
+        self.send_command(CMD_ENTER_ESCAPE_MODE, &mut buffer)?;
+        self.send_command(CMD_SET_MODE, &mut buffer)?;
+        self.send_command(CMD_MOTOR_JOGCON, &mut buffer)?;
+        self.send_command(CMD_EXIT_ESCAPE_MODE, &mut buffer)?;
+
+        Ok(())
+    }
+
+    /// Read various parameters from the controller including its current
+    /// status.
+    pub fn read_config(&mut self) -> Result<ControllerConfiguration, SPI::Error> {
+        let mut config: ControllerConfiguration = Default::default();
+        let mut buffer = [0u8; MESSAGE_MAX_LENGTH];
+
+        self.send_command(CMD_ENTER_ESCAPE_MODE, &mut buffer)?;
+
+        self.send_command(CMD_READ_STATUS, &mut buffer)?;
+        config.status.copy_from_slice(&buffer[HEADER_LEN..9]);
+
+        self.send_command(CMD_READ_CONST1A, &mut buffer)?;
+        config.const1a.copy_from_slice(&buffer[4..9]);
+
+        self.send_command(CMD_READ_CONST1B, &mut buffer)?;
+        config.const1b.copy_from_slice(&buffer[4..9]);
+
+        self.send_command(CMD_READ_CONST2, &mut buffer)?;
+        config.const2.copy_from_slice(&buffer[4..9]);
+
+        self.send_command(CMD_READ_CONST3A, &mut buffer)?;
+        config.const3a.copy_from_slice(&buffer[4..9]);
+
+        self.send_command(CMD_READ_CONST3B, &mut buffer)?;
+        config.const3b.copy_from_slice(&buffer[4..9]);
+
+        self.send_command(CMD_EXIT_ESCAPE_MODE, &mut buffer)?;
+
+        Ok(config)
+    }
+
+    fn read_port(
+        &mut self,
+        command: Option<&dyn PollCommand>,
+    ) -> Result<[u8; MESSAGE_MAX_LENGTH], Error<SPI::Error>> {
+        let mut buffer = [0u8; MESSAGE_MAX_LENGTH];
+        let mut data = [0u8; MESSAGE_MAX_LENGTH];
+
+        data[..CMD_POLL.len()].copy_from_slice(CMD_POLL);
+
+        // Overlay the command to send with the poll...
+        if let Some(x) = command {
+            x.set_command(&mut data[HEADER_LEN..]);
+        }
+
+        self.send_command(&data, &mut buffer)?;
+
+        Ok(buffer)
+    }
+
+    /// Get the raw data from polling for a controller. You can use this to cooerce the data into
+    /// some controller that can't be safely identified by `read_input`, but you should rely on that
+    /// function if you can.
+    pub fn read_raw(
+        &mut self,
+        command: Option<&dyn PollCommand>,
+    ) -> Result<ControllerData, Error<SPI::Error>> {
+        let mut buffer = [0u8; MESSAGE_MAX_LENGTH];
+        let data = self.read_port(command)?;
+
+        // Shift the controller data over because we don't need the header anymore
+        buffer[0..MESSAGE_MAX_LENGTH - 3].copy_from_slice(&data[HEADER_LEN..]);
+
+        Ok(ControllerData { data: buffer })
+    }
+
+    /// Ask the controller for input states. Different contoller types will be returned automatically
+    /// for you. If you'd like to cooerce a controller yourself, use `read_raw`.
+    pub fn read_input(
+        &mut self,
+        command: Option<&dyn PollCommand>,
+    ) -> Result<Device, Error<SPI::Error>> {
         let mut buffer = [0u8; MESSAGE_MAX_LENGTH];
         let data = self.read_port(command)?;
 
